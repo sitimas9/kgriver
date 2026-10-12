@@ -1,6 +1,6 @@
 # KGRiver — Signup Automation Toolkit
 
-Automate account provisioning + API key lifecycle + mint API key `rv_...`, full otomatis:
+Automate account provisioning + API key lifecycle toolkit. Full otomatis:
 signup → Cloudflare Turnstile → password → OTP email (IMAP) → token grab → mint key → verify chat.
 
 ## Hasil real
