@@ -167,11 +167,11 @@ def fetch_otp(cfg, imap_cfg, to_addr, timeout_s=None):
                     if to_addr.lower() not in to:
                         continue
                     body = _extract_body(msg)
-                    mm = re.search(r"\b(\d{6})\b", subj + " " + body)
-                    if mm:
-                        print(f"    [otp] {subj[:40]} code={mm.group(1)}", flush=True)
+                    code = extract_otp(subj + " " + body, exclude=[to_addr])
+                    if code:
+                        print(f"    [otp] {subj[:40]} code={code}", flush=True)
                         m.logout()
-                        return mm.group(1)
+                        return code
             try:
                 m.logout()
             except Exception:
@@ -180,6 +180,38 @@ def fetch_otp(cfg, imap_cfg, to_addr, timeout_s=None):
             print(f"    [imap: {str(e)[:70]}]", flush=True)
         time.sleep(interval)
     return None
+
+
+# --------------------------------------------------------------------------
+# OTP extraction (shared by IMAP and disposable-inbox paths)
+# --------------------------------------------------------------------------
+
+def extract_otp(blob, exclude=None):
+    """Pull a 6-digit code out of a mail body/subject.
+
+    Order matters: strip the recipient address and CSS hex colours FIRST,
+    otherwise a digit-run inside the address (u1234567890@host) or a colour
+    literal wins the regex. Tenant codes are usually standalone in their own
+    line/paragraph, so a whitespace-delimited match is the strongest signal.
+    """
+    text = blob or ""
+    for pat in (exclude or []):
+        if pat:
+            text = text.replace(pat, " ")
+            text = text.replace(pat.split("@")[0], " ")
+    text = re.sub(r"#[0-9a-fA-F]{3,8}", " ", text)      # css hex colours
+    text = re.sub(r"&[#a-zA-Z0-9]+;", " ", text)         # html entities
+    text = re.sub(r"https?://\S+", " ", text)            # urls (may carry ids)
+    text = re.sub(r"\b\d{7,}\b", " ", text)              # long digit runs (ids)
+    # strongest: standalone token surrounded by whitespace / tags
+    for pat in (r"(?:^|[\s>\"'])(\d{6})(?:$|[\s<\"',.])",
+                r"(?:code|kode|otp|verification)[^0-9]{0,30}(\d{6})",
+                r"(\d{6})[^0-9]{0,30}(?:code|kode|otp|expires|valid)"):
+        m = re.search(pat, text, re.I | re.M)
+        if m:
+            return m.group(1)
+    m = re.search(r"\b(\d{6})\b", text)
+    return m.group(1) if m else None
 
 
 def _extract_body(msg):
@@ -196,6 +228,95 @@ def _extract_body(msg):
         return (msg.get_payload(decode=True) or b"").decode(errors="replace")
     except Exception:
         return str(msg.get_payload())
+
+
+# --------------------------------------------------------------------------
+# Disposable-inbox provider (mail.tm compatible API)
+# --------------------------------------------------------------------------
+
+class MailTm:
+    """Thin client for mail.tm-style disposable inboxes (hydra API)."""
+
+    def __init__(self, base="https://api.mail.tm", domain=None, timeout=20):
+        self.base = base.rstrip("/")
+        self.domain = domain
+        self.timeout = timeout
+        self.address = None
+        self.password = None
+        self.token = None
+
+    def _req(self, method, path, body=None, token=None):
+        import urllib.request
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(body).encode() if body is not None else None,
+            method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                raw = r.read().decode(errors="replace")
+                return r.status, (json.loads(raw) if raw.strip() else {})
+        except Exception as e:
+            code = getattr(e, "code", 0)
+            try:
+                return code, json.loads(e.read().decode(errors="replace"))
+            except Exception:
+                return code, {"error": str(e)}
+
+    def pick_domain(self):
+        if self.domain:
+            return self.domain
+        st, d = self._req("GET", "/domains")
+        items = d.get("hydra:member") if isinstance(d, dict) else d
+        if st == 200 and isinstance(items, list):
+            active = [m["domain"] for m in items if isinstance(m, dict) and m.get("isActive")]
+            if active:
+                return active[0]
+        raise RuntimeError("no active mail.tm domain available")
+
+    def create(self, local=None):
+        domain = self.pick_domain()
+        local = local or ("u" + str(int(time.time() * 1000))[-9:] + os.urandom(2).hex())
+        self.address = f"{local}@{domain}"
+        self.password = os.urandom(9).hex() + "Aa1!"
+        st, _ = self._req("POST", "/accounts", {"address": self.address, "password": self.password})
+        if st not in (200, 201):
+            raise RuntimeError(f"mail.tm account create failed: {st}")
+        st, tok = self._req("POST", "/token", {"address": self.address, "password": self.password})
+        if st != 200 or "token" not in tok:
+            raise RuntimeError(f"mail.tm token failed: {st}")
+        self.token = tok["token"]
+        print(f"[*] inbox created: {self.address}", flush=True)
+        return self.address
+
+    def fetch_code(self, timeout_s=300, interval_s=6):
+        """Poll the inbox for a 6-digit code; scan newest-first."""
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            st, d = self._req("GET", "/messages", token=self.token)
+            if st == 200:
+                items = d.get("hydra:member") if isinstance(d, dict) else d
+                if isinstance(items, list):
+                    msgs = sorted(items, key=lambda m: (m.get("createdAt") if isinstance(m, dict) else "",), reverse=True)
+                    for m in msgs[:10]:
+                        if not isinstance(m, dict): continue
+                        mid = m.get("id")
+                        st2, full = self._req("GET", f"/messages/{mid}", token=self.token)
+                        if st2 != 200 or not isinstance(full, dict): continue
+                        blob = (m.get("subject") or "") + " " + json.dumps(full.get("text", "")) + " " + json.dumps(full.get("html", ""))
+                        try:
+                            with open("/tmp/kgriver_last_mail.json", "w") as _f:
+                                json.dump({"subject": m.get("subject"), "text": full.get("text"), "html": full.get("html")}, _f, indent=1)
+                        except Exception:
+                            pass
+                        code = extract_otp(blob, exclude=[self.address])
+                        if code:
+                            print(f"    [otp] {(m.get('subject') or '')[:40]} code={code}", flush=True)
+                            return code
+            time.sleep(interval_s)
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +341,69 @@ async def click_primary(page, cfg):
             except Exception:
                 continue
     return False
+
+
+async def submit_otp(page, cfg, otp):
+    """Fill the OTP field. WorkOS-style pages render a hidden aggregate input
+    (autocomplete=one-time-code, maxlength=6) plus per-digit boxes with
+    data-index. Filling the aggregate is the intended path; per-digit boxes
+    must be ordered by their data-index attribute, not DOM position."""
+    # 1) aggregate input (preferred)
+    agg = await page.query_selector("input[autocomplete='one-time-code']")
+    if agg:
+        try:
+            await agg.click(timeout=2500)
+        except Exception:
+            pass
+        try:
+            await agg.fill(otp, timeout=3000)
+        except Exception as e:
+            if "destroyed" in str(e):
+                return  # auto-submit fired
+            try:
+                await agg.type(otp, delay=90)
+            except Exception:
+                pass
+        await page.wait_for_timeout(2500)
+        # did the boxes fill?
+        try:
+            filled = await page.evaluate(
+                "() => Array.from(document.querySelectorAll(\"input[data-index]\")).filter(i => i.value).length")
+            if filled and filled >= len(otp) - 1:
+                await click_primary(page, cfg)
+                await page.wait_for_timeout(6500)
+                return
+        except Exception:
+            pass
+    # 2) per-digit boxes ordered by data-index
+    boxes = {}
+    try:
+        els = await page.query_selector_all("input[data-index]")
+    except Exception:
+        return  # navigation happened — treat as auto-submit
+    for el in els:
+        try:
+            idx = int(await el.get_attribute("data-index"))
+            boxes[idx] = el
+        except Exception:
+            pass
+    if boxes:
+        for i, ch in enumerate(otp):
+            el = boxes.get(i + 1)
+            if not el:
+                continue
+            try:
+                await el.fill(ch, timeout=1500)
+            except Exception as e:
+                if "destroyed" in str(e):
+                    return
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            pass
+    await page.wait_for_timeout(2500)
+    await click_primary(page, cfg)
+    await page.wait_for_timeout(6500)
 
 
 async def handle_challenge(page, cfg, attempts=8, rounds=4):
@@ -306,7 +490,7 @@ def verify_key(cfg, api_key):
 # Core provisioning flow
 # --------------------------------------------------------------------------
 
-async def provision_account(email_addr, password, cfg, imap_cfg):
+async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
     import cloakbrowser
 
     captured = {"token_body": None}
@@ -369,21 +553,33 @@ async def provision_account(email_addr, password, cfg, imap_cfg):
 
         if cfg["selectors"]["otp_url_fragment"] in page.url:
             print(f"[*] awaiting OTP -> {email_addr}", flush=True)
-            otp = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: fetch_otp(cfg, imap_cfg, email_addr))
+            if mail_box is not None:
+                otp = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: mail_box.fetch_code(
+                        timeout_s=cfg["timing"]["otp_timeout_s"],
+                        interval_s=cfg["timing"]["imap_poll_interval_s"]))
+            else:
+                otp = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: fetch_otp(cfg, imap_cfg, email_addr))
             if not otp:
                 print("[!] OTP timeout", flush=True)
                 return None
             print(f"[*] OTP: {otp}", flush=True)
-            # some flows auto-submit on fill (navigation destroys the context)
-            for ci in await page.query_selector_all("input"):
-                try:
-                    await ci.fill(otp, timeout=2500)
-                    break
-                except Exception as e:
-                    if "destroyed" in str(e):
-                        break
-            await page.wait_for_timeout(9000)
+            try:
+                await page.screenshot(path="/tmp/kgriver_otp_page.png", full_page=True)
+                with open("/tmp/kgriver_otp_page.html", "w") as _f:
+                    _f.write(await page.content())
+                print("    [dbg] otp page dumped", flush=True)
+            except Exception as _e:
+                print("    [dbg] dump fail", _e, flush=True)
+            await submit_otp(page, cfg, otp)
+            try:
+                await page.screenshot(path="/tmp/kgriver_otp_after.png", full_page=True)
+                with open("/tmp/kgriver_otp_after.html", "w") as _f:
+                    _f.write(await page.content())
+                print("    [dbg] after-submit page dumped ->", page.url[:80], flush=True)
+            except Exception:
+                pass
 
         console_host = cfg["target"]["console_base"].split("//")[-1].split("/")[0]
         for _ in range(10):
@@ -450,12 +646,22 @@ async def main():
     cfg_path = None
     if "--config" in sys.argv:
         cfg_path = sys.argv[sys.argv.index("--config") + 1]
+    use_tmail = "--tmail" in sys.argv or os.environ.get("KGR_TMAIL") == "1"
+    cfg = load_config(cfg_path)
+    if use_tmail:
+        mb_cfg = (cfg.get("integrations") or {}).get("tmail") or {}
+        box = MailTm(base=mb_cfg.get("base", "https://api.mail.tm"),
+                     domain=mb_cfg.get("domain"))
+        email_addr = box.create()
+        password = args[0] if args else os.environ.get("KGR_PASSWORD", "ChangeMe!2026")
+        rec = await provision_account(email_addr, password, cfg, None, mail_box=box)
+        print("[RESULT]", ("OK " + rec["api_key"][:24]) if rec else "FAILED", flush=True)
+        return
     if not args:
-        print("usage: kgriver.py <email> [password] [--config path]")
+        print("usage: kgriver.py <email> [password] [--config path] [--tmail]")
         sys.exit(1)
     email_addr = args[0]
     password = args[1] if len(args) > 1 else os.environ.get("KGR_PASSWORD", "ChangeMe!2026")
-    cfg = load_config(cfg_path)
     if not cfg["target"]["signup_url"]:
         print("[!] target.signup_url not set — configure config.yaml or KGR_SIGNUP_URL")
         sys.exit(2)
