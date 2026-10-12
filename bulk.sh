@@ -1,11 +1,13 @@
 #!/bin/bash
+# 2-worker bulk runner
+# Usage: EMAIL='you@gmail.com' PASS='StrongPass!1' ./bulk.sh <start> <count>
 # Bulk runner 2-worker — W1: 16-20, W2: 21-25 (offset biar gak tabrakan)
 # Usage: ./bulk.sh <start> <count>
 START=${1:-26}; COUNT=${2:-5}
 MID=$((START + COUNT))
 (
   for n in $(seq $START $((MID-1))); do
-    timeout 780 python3 -u river_farmer.py "EMAILUSER+river$n@gmail.com" 'PasswordKuat!1' 2>&1 | grep -E "BALANCE|RESULT|no token|OTP timeout"
+    timeout 780 python3 -u kgriver.py "$EMAIL+alias$n@gmail.com" '$PASS' 2>&1 | grep -E "BALANCE|RESULT|no token|OTP timeout"
     sleep 45
   done
 ) > w1.log 2>&1 &
@@ -13,7 +15,7 @@ W1=$!
 (
   sleep 90
   for n in $(seq $MID $((START+2*COUNT-1))); do
-    timeout 780 python3 -u river_farmer.py "EMAILUSER+river$n@gmail.com" 'PasswordKuat!1' 2>&1 | grep -E "BALANCE|RESULT|no token|OTP timeout"
+    timeout 780 python3 -u kgriver.py "$EMAIL+alias$n@gmail.com" '$PASS' 2>&1 | grep -E "BALANCE|RESULT|no token|OTP timeout"
     sleep 45
   done
 ) > w2.log 2>&1 &

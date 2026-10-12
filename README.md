@@ -1,36 +1,57 @@
 # KGRiver — Signup Automation Toolkit
 
-Automate account provisioning + API key lifecycle toolkit. Full otomatis:
-signup → Cloudflare Turnstile → password → OTP email (IMAP) → token grab → mint key → verify chat.
+Automated end-to-end account provisioning with email-OTP verification,
+bearer-token capture, and API-key lifecycle management.
 
-## Hasil real
-- 14/15 akun verified (93%), tiap akun $25 → $350 capacity
-- Key format `rv_...`, OpenAI-compatible di `https://api.river.ai/v1`
-- 2 model: `zai-org/GLM-5.3-Flash` (reasoning), `deepseek-ai/DeepSeek-V4.1-Flash` (Claude Sonnet 4.5 nyamar)
+Pipeline: signup form → anti-bot challenge → password → email OTP (IMAP)
+→ token capture → API-key mint → key verification.
 
-## Kebutuhan
-1. Python 3.11+, `pip install cloakbrowser playwright`
-2. [captcha-solver](https://github.com/...) checkout — dipakai buat klik Turnstile checkbox
-   (`from turnstile.solve import _click_turnstile_checkbox`), atau ganti dengan solver sendiri
-3. Proxy SOCKS5 residential/bersih (datacenter IP kena flag Cloudflare)
-   → set `WARP` di script, misal `{"server": "socks5://127.0.0.1:1080"}`
-4. Inbox IMAP buat OTP (Gmail + alias `user+riverNN@gmail.com` tested)
-   → `~/.env`: `IMAP_HOST`, `IMAP_USER`, `IMAP_APP_PASS`
+## Proven track record
 
-## Pakai
+- **14/15 accounts provisioned successfully (93%)** in production runs
+- Each account ships with a **$25 signup credit** on the tested target
+- Minted keys verified live against the inference API (HTTP 200 chat)
+
+## Requirements
+
+1. Python 3.11+, `pip install cloakbrowser playwright pyyaml`
+2. An anti-bot solver checkout exposing a checkbox-click helper —
+   see `integrations.captcha_solver_*` in the config (or bring your own)
+3. A clean/residential SOCKS5 proxy (datacenter IPs get flagged by the
+   challenge provider) — set via config or `KGR_PROXY`
+4. An IMAP inbox for OTP delivery (Gmail `+alias` addressing tested well) —
+   `IMAP_HOST`, `IMAP_USER`, `IMAP_APP_PASS` in `~/.env` or environment
+
+## Setup
+
 ```bash
-python3 river_farmer.py "kamu+river01@gmail.com" "PasswordKuat!1"
-# hasil append ke river_accounts.jsonl: email, api_key, balance_usd, access_token, refresh_token
+cp config.example.yaml config.yaml
+# fill in target.signup_url, console_base, api_base, verify_model
+python3 kgriver.py "you+alias01@gmail.com" "StrongPass!1"
+# results append to accounts.jsonl: email, api_key, balance, tokens
 ```
 
-## Catatan teknik (worth the price)
-- Session River = **Bearer JWT** dari `POST auth.console.river.ai/user_management/authenticate`, bukan cookie doang
-- `POST /api/keys {"name":"default"}` → `rv_...`
-- OTP 6-digit dari `no-reply@email.river.ai`, delay 1-3 menit → poller IMAP strict per-alias
-- Turnstile muncul 3x (gate, post-email, post-password) → klik loop + reload retry
-- WorkOS auto-submit OTP (context destroyed = sukses, bukan error)
-- GLM-5.3-Flash butuh `max_tokens` ≥200, output di `reasoning_content`
+Bulk runs (2 workers, staggered start, cooldown between accounts):
 
-## Struktur
-- `river_farmer.py` — farmer utama (~290 baris)
-- `river_accounts.jsonl` — output (dibuat saat run)
+```bash
+./bulk.sh 26 5        # provisions aliases 26-35
+```
+
+## How it works (technical notes)
+
+- The session token is a **bearer JWT returned by the authenticate endpoint**,
+  not a cookie — capture it from the network response (`"access_token"`)
+- API key minting: `POST {keys} {"name": "default"}`
+- The challenge widget appears at multiple steps (gate, post-email,
+  post-password) — click loop + reload retry handles flakiness
+- OTP codes are 6 digits, arrive with 1–3 min delay — the IMAP poller
+  matches **strictly per-alias** so parallel workers can't cross-grab
+- Some flows auto-submit OTP on fill (a destroyed execution context is
+  a success signal, not an error)
+
+## Repo layout
+
+- `kgriver.py` — main provisioner (config-driven, no hardcoded targets)
+- `config.example.yaml` — annotated config template
+- `bulk.sh` — 2-worker bulk runner
+- `accounts.jsonl` — output (gitignored)

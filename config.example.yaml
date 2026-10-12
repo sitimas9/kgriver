@@ -1,0 +1,53 @@
+# KGRiver configuration — copy to config.yaml and fill in your values.
+# config.yaml is gitignored (it holds target specifics).
+
+target:
+  # Signup entry URL of the provisioning target, e.g.
+  # signup_url: "https://site.example/sign-up?client_id=YOUR_CLIENT_ID"
+  signup_url: ""
+  # Console origin (where the authenticated app lives)
+  # console_base: "https://console.example"
+  console_base: ""
+  # Inference API origin used for key verification
+  # api_base: "https://api.example"
+  api_base: ""
+  # Fragment of the endpoint that returns the auth token on POST
+  authenticate_path_fragment: "user_management/authenticate"
+
+selectors:
+  email_input: "input[name='email'], input[type='email']"
+  text_inputs: "input[type='text'], input[type='email']"
+  password_input: "input[type='password']"
+  otp_url_fragment: "email-verification"
+  continue_buttons:
+    - "button:has-text('Continue')"
+    - "button:has-text('Verify')"
+    - "button:has-text('Submit')"
+    - "button[type='submit']"
+
+api:
+  me: "/api/me"
+  billing: "/api/billing/account"
+  keys: "/api/keys"
+  chat: "/v1/chat/completions"
+
+integrations:
+  # Path to a captcha/anti-bot solver checkout exposing
+  # <module>.<func>(page, attempts=N)
+  captcha_solver_path: "~/captcha-solver"
+  captcha_solver_module: "turnstile.solve"
+  captcha_solver_func: "_click_turnstile_checkbox"
+  # Clean/residential SOCKS5 — datacenter IPs get flagged
+  proxy:
+    server: "socks5://127.0.0.1:1080"
+
+# Model id used for the post-mint key verification call.
+verify_model: ""
+
+output:
+  accounts_file: "./accounts.jsonl"
+  cookie_dir: "./state"
+
+timing:
+  otp_timeout_s: 300
+  imap_poll_interval_s: 6

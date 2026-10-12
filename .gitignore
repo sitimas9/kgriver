@@ -1,4 +1,5 @@
-river_accounts.jsonl
+accounts.jsonl
+config.yaml
 state/
 *.log
 .env
