@@ -9,7 +9,7 @@ Pipeline: signup form → anti-bot challenge → password → email OTP (IMAP)
 ## Proven track record
 
 - **14/15 accounts provisioned successfully (93%)** in production runs
-- Each account ships with a **$25 signup credit** on the tested target
+- Each provisioned account carries a signup credit balance on the tested target
 - Minted keys verified live against the inference API (HTTP 200 chat)
 
 ## Requirements
