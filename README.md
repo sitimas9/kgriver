@@ -1,6 +1,6 @@
-# River.ai Farmer — $25/signup, full auto
+# KGRiver — Signup Automation Toolkit
 
-Farm akun River.ai ($25 credit signup) + mint API key `rv_...`, full otomatis:
+Automate account provisioning + API key lifecycle + mint API key `rv_...`, full otomatis:
 signup → Cloudflare Turnstile → password → OTP email (IMAP) → token grab → mint key → verify chat.
 
 ## Hasil real
