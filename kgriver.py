@@ -276,14 +276,29 @@ class MailTm:
                 return active[0]
         raise RuntimeError("no active mail.tm domain available")
 
-    def create(self, local=None):
+    def create(self, local=None, retries=4):
         domain = self.pick_domain()
         local = local or ("u" + str(int(time.time() * 1000))[-9:] + os.urandom(2).hex())
         self.address = f"{local}@{domain}"
         self.password = os.urandom(9).hex() + "Aa1!"
-        st, _ = self._req("POST", "/accounts", {"address": self.address, "password": self.password})
-        if st not in (200, 201):
+        # mail.tm rate-limits account creation per IP — back off and retry.
+        st = None
+        for attempt in range(retries):
+            st, _ = self._req("POST", "/accounts", {"address": self.address, "password": self.password})
+            if st in (200, 201):
+                break
+            if st == 429:
+                wait = 20 * (attempt + 1)
+                print(f"[*] mail.tm 429, backoff {wait}s (attempt {attempt + 1}/{retries})", flush=True)
+                time.sleep(wait)
+                # rotate the local part so we don't collide with a half-created account
+                local = "u" + str(int(time.time() * 1000))[-9:] + os.urandom(2).hex()
+                self.address = f"{local}@{domain}"
+                self.password = os.urandom(9).hex() + "Aa1!"
+                continue
             raise RuntimeError(f"mail.tm account create failed: {st}")
+        if st not in (200, 201):
+            raise RuntimeError(f"mail.tm account create rate-limited after {retries} attempts: {st}")
         st, tok = self._req("POST", "/token", {"address": self.address, "password": self.password})
         if st != 200 or "token" not in tok:
             raise RuntimeError(f"mail.tm token failed: {st}")
@@ -543,12 +558,36 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
         pw = await page.query_selector(cfg["selectors"]["password_input"])
         if pw:
             print("[*] password step", flush=True)
-            await handle_challenge(page, cfg, attempts=8, rounds=3)
-            await pw.fill(password)
-            await page.wait_for_timeout(900)
-            await click_primary(page, cfg)
-            await page.wait_for_timeout(7000)
-            await handle_challenge(page, cfg, attempts=8, rounds=3)
+            # Submit with retry: a stale Turnstile token makes the button a no-op,
+            # leaving the page parked on sign-up/password. Re-solve + resubmit.
+            for attempt in range(3):
+                await handle_challenge(page, cfg, attempts=8, rounds=3)
+                try:
+                    cur = await page.query_selector(cfg["selectors"]["password_input"])
+                    if cur:
+                        await cur.fill(password)
+                    else:
+                        await pw.fill(password)
+                except Exception as e:
+                    if "destroyed" in str(e):
+                        break
+                await page.wait_for_timeout(1200)
+                await click_primary(page, cfg)
+                await page.wait_for_timeout(7000)
+                await handle_challenge(page, cfg, attempts=8, rounds=3)
+                if cfg["selectors"]["otp_url_fragment"] in page.url or "callback" in page.url:
+                    break
+                stuck = "sign-up/password" in page.url or "sign-up?" in page.url
+                print(f"    [password attempt {attempt + 1}] still at {page.url[:70]} stuck={stuck}", flush=True)
+                if not stuck:
+                    break
+                try:
+                    with open(f"/tmp/kgriver_pw_stuck_{attempt}.html", "w") as _f:
+                        _f.write(await page.content())
+                    await page.screenshot(path=f"/tmp/kgriver_pw_stuck_{attempt}.png", full_page=True)
+                    print(f"    [dbg] stuck dump {attempt}", flush=True)
+                except Exception:
+                    pass
         print("[*] after password:", page.url[:110], flush=True)
 
         if cfg["selectors"]["otp_url_fragment"] in page.url:
