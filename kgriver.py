@@ -346,15 +346,45 @@ def _get_captcha_solver(cfg):
     return getattr(mod, cfg["integrations"]["captcha_solver_func"])
 
 
+OAUTH_WORDS = ("google", "github", "microsoft", "apple", "sso", "passkey", "saml", "okta")
+
+
 async def click_primary(page, cfg):
+    """Click the real submit button. OAuth provider buttons (e.g. 'Continue with
+    Google') match the same :has-text('Continue') selector and sit earlier in
+    the DOM — skipping them is mandatory or the form never submits."""
     for sel in cfg["selectors"]["continue_buttons"]:
-        b = await page.query_selector(sel)
-        if b:
+        for b in await page.query_selector_all(sel):
             try:
+                txt = ((await b.inner_text()) or "").strip()
+            except Exception:
+                txt = ""
+            if any(w in txt.lower() for w in OAUTH_WORDS):
+                continue
+            try:
+                if not await b.is_visible():
+                    continue
                 await b.click(timeout=5000)
+                print(f"    [click] {sel} -> {txt[:34]!r}", flush=True)
                 return True
             except Exception:
                 continue
+    return False
+
+
+async def submit_form(page, cfg, email_sel):
+    """click_primary, then fall back to Enter-in-email-field (React forms
+    sometimes ignore a synthetic click pre-hydration)."""
+    if await click_primary(page, cfg):
+        return True
+    print("    [click] no button matched — trying Enter fallback", flush=True)
+    try:
+        el = await page.query_selector(email_sel)
+        if el:
+            await el.press("Enter")
+            return True
+    except Exception as e:
+        print(f"    [click] Enter fallback err: {e}", flush=True)
     return False
 
 
@@ -508,16 +538,35 @@ def verify_key(cfg, api_key):
 async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
     import cloakbrowser
 
-    captured = {"token_body": None}
+    captured: dict = {"token_body": None, "req_token": None}
 
     async def on_resp(resp):
         try:
+            url = resp.url
             frag = cfg["target"]["authenticate_path_fragment"]
-            if frag in resp.url and resp.request.method == "POST":
+            if frag in url and resp.request.method == "POST":
                 body = await resp.text()
                 if '"access_token"' in body:
                     captured["token_body"] = body
                     print("    [+] token captured", flush=True)
+                else:
+                    print(f"    [!] auth {resp.status}: {body[:300]}", flush=True)
+            elif resp.request.method == "POST" and "login.console.river.ai" in url:
+                body = await resp.text()
+                print(f"    [net] {resp.status} POST {url.split('?')[0][-70:]} -> {body[:220]}", flush=True)
+        except Exception:
+            pass
+
+    def on_request(req):
+        # Donor trick (river.js): grab Bearer token straight from request
+        # headers — fires even when the response body isn't observable.
+        try:
+            h = req.headers or {}
+            a = h.get("authorization") or ""
+            if a.lower().startswith("bearer ") and "workos" not in (req.url or ""):
+                if not captured.get("req_token"):
+                    captured["req_token"] = a[7:].strip()
+                    print(f"    [dbg] req-token captured len={len(captured['req_token'])}", flush=True)
         except Exception:
             pass
 
@@ -525,6 +574,7 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
     async with await cloakbrowser.launch_async(headless=True, humanize=True, proxy=proxy) as browser:
         page = await browser.new_page()
         page.on("response", lambda r: asyncio.create_task(on_resp(r)))
+        page.on("request", lambda r: on_request(r))
 
         await page.goto(cfg["target"]["signup_url"], wait_until="domcontentloaded", timeout=45000)
         ready = False
@@ -547,19 +597,47 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
             return None
         pool = cfg["identity"]["name_pool"]
         fn, ln = pool[int(time.time()) % len(pool)]
-        await inputs[0].fill(fn)
-        await inputs[1].fill(ln)
-        await inputs[2].fill(email_addr)
-        await page.wait_for_timeout(1200)
-        await click_primary(page, cfg)
-        await page.wait_for_timeout(6000)
-        await handle_challenge(page, cfg, attempts=8, rounds=3)
+        step1_ok = False
+        for s1 in range(3):
+            inputs = await page.query_selector_all(cfg["selectors"]["text_inputs"])
+            if len(inputs) < 3:
+                print("[!] form inputs missing", flush=True)
+                return None
+            try:
+                await inputs[0].fill(fn)
+                await inputs[1].fill(ln)
+                await inputs[2].fill(email_addr)
+            except Exception as e:
+                print(f"    [step1 attempt {s1 + 1}] fill err: {e}", flush=True)
+            await page.wait_for_timeout(1500)
+            await submit_form(page, cfg, cfg["selectors"]["email_input"])
+            await page.wait_for_timeout(7000)
+            await handle_challenge(page, cfg, attempts=8, rounds=3)
+            try:
+                cur_url = page.url
+            except Exception:
+                cur_url = ""
+            path = cur_url.split("?")[0]
+            pw_check = await page.query_selector(cfg["selectors"]["password_input"])
+            advanced = ("password" in path or "email-verification" in path
+                        or "callback" in path or bool(pw_check))
+            if advanced:
+                step1_ok = True
+                print(f"    [step1 attempt {s1 + 1}] advanced: {path}", flush=True)
+                break
+            print(f"    [step1 attempt {s1 + 1}] still at {path} — retry", flush=True)
+        if not step1_ok:
+            print("[!] step1 submit never advanced — bail", flush=True)
+            return None
 
         pw = await page.query_selector(cfg["selectors"]["password_input"])
         if pw:
             print("[*] password step", flush=True)
             # Submit with retry: a stale Turnstile token makes the button a no-op,
             # leaving the page parked on sign-up/password. Re-solve + resubmit.
+            # BUT: policy_denied (WorkOS Radar) must NOT be retried — hammering the
+            # same email+Turnstile escalates the block. Detect it and bail at once.
+            denied = False
             for attempt in range(3):
                 await handle_challenge(page, cfg, attempts=8, rounds=3)
                 try:
@@ -568,14 +646,23 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
                         await cur.fill(password)
                     else:
                         await pw.fill(password)
+                    # let the Turnstile token mint/settle before submitting
+                    await page.wait_for_timeout(2500)
                 except Exception as e:
                     if "destroyed" in str(e):
                         break
-                await page.wait_for_timeout(1200)
                 await click_primary(page, cfg)
                 await page.wait_for_timeout(7000)
                 await handle_challenge(page, cfg, attempts=8, rounds=3)
                 if cfg["selectors"]["otp_url_fragment"] in page.url or "callback" in page.url:
+                    break
+                try:
+                    body = await page.content()
+                except Exception:
+                    body = ""
+                if "policy_denied" in body or "Access blocked" in body:
+                    denied = True
+                    print("    [!] policy_denied (WorkOS Radar) — stop, do not retry", flush=True)
                     break
                 stuck = "sign-up/password" in page.url or "sign-up?" in page.url
                 print(f"    [password attempt {attempt + 1}] still at {page.url[:70]} stuck={stuck}", flush=True)
@@ -583,11 +670,13 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
                     break
                 try:
                     with open(f"/tmp/kgriver_pw_stuck_{attempt}.html", "w") as _f:
-                        _f.write(await page.content())
+                        _f.write(body)
                     await page.screenshot(path=f"/tmp/kgriver_pw_stuck_{attempt}.png", full_page=True)
                     print(f"    [dbg] stuck dump {attempt}", flush=True)
                 except Exception:
                     pass
+            if denied:
+                return None
         print("[*] after password:", page.url[:110], flush=True)
 
         if cfg["selectors"]["otp_url_fragment"] in page.url:
@@ -628,16 +717,29 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
         print("[*] landed:", page.url[:100], flush=True)
 
         for _ in range(12):
-            if captured["token_body"]:
+            if captured["token_body"] or captured["req_token"]:
                 break
             await page.wait_for_timeout(2500)
-        if not captured["token_body"]:
+        tok = None
+        if captured["token_body"]:
+            try:
+                auth = json.loads(captured["token_body"])
+                tok = auth.get("access_token")
+                print(f"[*] token len={len(tok or '')} user={(auth.get('user') or {}).get('email')}", flush=True)
+            except Exception as e:
+                print(f"[!] token_body parse fail: {e}", flush=True)
+        if not tok and captured["req_token"]:
+            # donor path: validate the request-header token against /api/me
+            st0, _me0 = api_call(cfg, "me", "GET", bearer=captured["req_token"])
+            if st0 == 200:
+                tok = captured["req_token"]
+                print(f"[*] req-token validated len={len(tok)}", flush=True)
+            else:
+                print(f"[!] req-token rejected me={st0}", flush=True)
+        if not tok:
             print("[!] no token captured", flush=True)
             return None
-
-        auth = json.loads(captured["token_body"])
-        tok = auth["access_token"]
-        print(f"[*] token len={len(tok)} user={(auth.get('user') or {}).get('email')}", flush=True)
+        auth = {"access_token": tok}
 
         st, _me = api_call(cfg, "me", "GET", bearer=tok)
         st2, bal = api_call(cfg, "billing", "GET", bearer=tok)
@@ -661,6 +763,7 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
             "refresh_token": auth.get("refresh_token"),
             "api_key": newkey,
             "key_id": keyobj.get("id"),
+            "key_name": keyobj.get("name"),
             "balance_usd": balance,
             "verify_ok": ok,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -669,6 +772,27 @@ async def provision_account(email_addr, password, cfg, imap_cfg, mail_box=None):
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "a") as f:
             f.write(json.dumps(rec) + "\n")
+        # donor-style JSON/CSV mirror (audit-friendly, safe-to-share format)
+        try:
+            base = os.path.splitext(out)[0]
+            accs = []
+            if os.path.exists(base + ".json"):
+                try:
+                    accs = json.load(open(base + ".json")).get("accounts", [])
+                except Exception:
+                    accs = []
+            accs.append({"status": "ok", "email": email_addr, "password": password,
+                         "api_key": newkey, "key_name": keyobj.get("name"),
+                         "balance_usd": balance, "verify_ok": ok,
+                         "created": rec["created"]})
+            json.dump({"generated_at": rec["created"], "total": len(accs),
+                       "succeeded": sum(1 for a in accs if a.get("api_key")),
+                       "accounts": accs}, open(base + ".json", "w"), indent=2)
+            with open(base + ".csv", "a") as f:
+                f.write(",".join(["ok", email_addr, password, newkey,
+                                  str(keyobj.get("name")), str(balance), str(ok)]) + "\n")
+        except Exception as e:
+            print(f"[!] json/csv mirror fail: {e}", flush=True)
         try:
             cdir = cfg["output"]["cookie_dir"]
             os.makedirs(cdir, exist_ok=True)
